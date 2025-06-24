@@ -3,94 +3,111 @@ import snowflake.connector
 import pandas as pd
 import os
 
-# Load config from Streamlit secrets
+from io import BytesIO
+
+# Load Snowflake config from secrets
 sf_config = st.secrets["snowflake"]
 
-# Connect to Snowflake
-conn = snowflake.connector.connect(
-    user=sf_config["user"],
-    password=sf_config["password"],
-    account=sf_config["account"],
-    warehouse=sf_config["warehouse"],
-    database=sf_config["database"],
-    schema=sf_config["schema"],
-    role=sf_config.get("role", None)
-)
+def create_connection():
+    return snowflake.connector.connect(
+        user=sf_config["user"],
+        password=sf_config["password"],
+        account=sf_config["account"],
+        warehouse=sf_config["warehouse"],
+        database=sf_config["database"],
+        schema=sf_config["schema"],
+        role=sf_config.get("role", None)
+    )
 
-st.title("📤 Upload Sales File to Snowflake")
+def infer_column_types(df):
+    type_map = {
+        "int64": "INT",
+        "float64": "FLOAT",
+        "object": "STRING",
+        "datetime64[ns]": "TIMESTAMP",
+        "bool": "BOOLEAN"
+    }
+    return [f'"{col}" {type_map[str(dtype)]}' for col, dtype in zip(df.columns, df.dtypes)]
 
-uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+def upload_and_ingest(file, file_type):
+    # Load file into DataFrame
+    if file_type == "csv":
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
 
-if uploaded_file:
-    # Use original file name
-    temp_file_path = uploaded_file.name
-    with open(temp_file_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
+    st.write("✅ File preview:")
+    st.dataframe(df.head())
 
+    # Connect to Snowflake
+    conn = create_connection()
     cs = conn.cursor()
 
     try:
-        # Upload to internal stage
-        put_command = f"PUT file://{os.path.abspath(temp_file_path)} @sales_stage_v1 AUTO_COMPRESS=TRUE"
-        cs.execute(put_command)
-        st.success("✅ File uploaded to Snowflake internal stage!")
+        table_name = "DYNAMIC_UPLOAD_TABLE"
 
-        # Ingest into table
-        gzip_name = uploaded_file.name + ".gz"
+        # Build CREATE TABLE statement
+        column_defs = ", ".join(infer_column_types(df))
+        create_table_sql = f'CREATE OR REPLACE TABLE {table_name} ({column_defs})'
+        cs.execute(create_table_sql)
+
+        # Save to temporary CSV for upload
+        temp_file_path = "temp_uploaded.csv"
+        df.to_csv(temp_file_path, index=False)
+
+        # Upload to stage
+        put_command = f"PUT file://{os.path.abspath(temp_file_path)} @%{table_name} AUTO_COMPRESS=TRUE"
+        cs.execute(put_command)
+
+        # Ingest using COPY INTO
         copy_command = f"""
-        COPY INTO RAW.SALES_RAW
-        FROM @sales_stage_v1
-        FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1)
-        PATTERN = '.*{gzip_name}';
+        COPY INTO {table_name}
+        FROM @%{table_name}
+        FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"')
+        ON_ERROR = 'CONTINUE'
         """
         cs.execute(copy_command)
-        st.success("✅ Data ingested into RAW.SALES_RAW!")
 
-        # Preview data
-        preview_query = "SELECT * FROM RAW.SALES_RAW LIMIT 100"
-        df = pd.read_sql(preview_query, conn)
-        df.columns = [col.lower() for col in df.columns]
+        st.success("🎉 File uploaded and ingested into Snowflake successfully!")
 
-        st.subheader("👀 Data Preview")
-        st.dataframe(df)
-
-        st.markdown("---")
-        st.subheader("📊 Sales Dashboard")
-
-        # Convert order_date
-        df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
-
-        # Date range filter
-        min_date, max_date = df['order_date'].min(), df['order_date'].max()
-        date_range = st.date_input("Select Order Date Range", [min_date, max_date])
-
-        # Filter data
-        filtered_df = df[
-            (df['order_date'].dt.date >= date_range[0]) &
-            (df['order_date'].dt.date <= date_range[1])
-        ]
-
-        # Revenue calculation
-        filtered_df['revenue'] = filtered_df['quantity'] * filtered_df['price']
-
-        # KPIs
-        total_orders = filtered_df.shape[0]
-        total_quantity = filtered_df['quantity'].sum()
-        total_revenue = filtered_df['revenue'].sum()
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("🧾 Total Orders", total_orders)
-        col2.metric("📦 Quantity Sold", int(total_quantity))
-        col3.metric("💰 Total Revenue", f"${total_revenue:,.2f}")
-
-        # Bar chart
-        st.subheader("💹 Revenue by Product")
-        product_revenue = filtered_df.groupby("product_id")["revenue"].sum().sort_values(ascending=False)
-        st.bar_chart(product_revenue)
+        # Show dashboard
+        show_dashboard(df, table_name)
 
     except Exception as e:
-        st.error(f"❌ Error: {e}")
+        st.error(f"❌ Error during ingestion: {e}")
     finally:
         cs.close()
         conn.close()
-        os.remove(temp_file_path)
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+def show_dashboard(df, table_name):
+    st.subheader("📊 Dashboard")
+    if 'date' in df.columns.str.lower().tolist():
+        try:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            date_col = 'date'
+        except:
+            date_col = None
+    else:
+        date_col = None
+
+    st.metric("Total Rows", df.shape[0])
+    st.metric("Total Columns", df.shape[1])
+
+    # Show column-wise summary
+    st.write("🧾 Summary:")
+    st.dataframe(df.describe(include='all'))
+
+    # If numeric columns, show chart
+    numeric_cols = df.select_dtypes(include='number').columns
+    if len(numeric_cols) >= 1:
+        st.subheader("📈 Sample Chart")
+        st.bar_chart(df[numeric_cols].head(20))
+
+st.title("🧠 Smart Snowflake Uploader + Dashboard")
+file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+
+if file:
+    file_type = "csv" if file.name.endswith(".csv") else "excel"
+    upload_and_ingest(file, file_type)
