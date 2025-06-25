@@ -2,7 +2,7 @@ import streamlit as st
 
 # Load Firebase config from secrets
 FIREBASE_CONFIG = {
-    "api_key": st.secrets["firebase"]["api_key"],
+    "apiKey": st.secrets["firebase"]["api_key"],
     "authDomain": st.secrets["firebase"]["auth_domain"],
     "projectId": st.secrets["firebase"]["project_id"],
     "storageBucket": st.secrets["firebase"]["storage_bucket"],
