@@ -1,4 +1,4 @@
-import pyrebase
+import pyrebase4 as pyrebase
 
 from config import FIREBASE_CONFIG
 
