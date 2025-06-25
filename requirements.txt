@@ -56,4 +56,4 @@ urllib3==2.5.0
 watchdog==6.0.0
 matplotlib==3.8.4
 setuptools>=68.0.0
-
+pyrebase==3.0.27
