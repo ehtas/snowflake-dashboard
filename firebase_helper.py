@@ -1,4 +1,4 @@
-import pyrebase_auth as pyrebase
+import pyrebase
 
 from config import FIREBASE_CONFIG
 
