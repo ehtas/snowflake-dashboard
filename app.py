@@ -1,113 +1,120 @@
 import streamlit as st
-import snowflake.connector
 import pandas as pd
 import os
-
+from config import SNOWFLAKE_CONFIG
+from firebase_helper import login_user, signup_user
+import snowflake.connector
 from io import BytesIO
+import seaborn as sns
+import matplotlib.pyplot as plt
 
-# Load Snowflake config from secrets
-sf_config = st.secrets["snowflake"]
+st.set_page_config("📊 Smart Data Insights", layout="wide")
+# ----------------------------- Auth Logic -----------------------------
+if "user" not in st.session_state:
+    st.session_state["user"] = None
 
-def create_connection():
-    return snowflake.connector.connect(
-        user=sf_config["user"],
-        password=sf_config["password"],
-        account=sf_config["account"],
-        warehouse=sf_config["warehouse"],
-        database=sf_config["database"],
-        schema=sf_config["schema"],
-        role=sf_config.get("role", None)
-    )
+def login_ui():
+    st.title("🔐 Login to Upload Data")
 
-def infer_column_types(df):
-    type_map = {
-        "int64": "INT",
-        "float64": "FLOAT",
-        "object": "STRING",
-        "datetime64[ns]": "TIMESTAMP",
-        "bool": "BOOLEAN"
-    }
-    return [f'"{col}" {type_map[str(dtype)]}' for col, dtype in zip(df.columns, df.dtypes)]
+    auth_mode = st.radio("Choose mode", ["Login", "Sign Up"], horizontal=True)
 
-def upload_and_ingest(file, file_type):
-    # Load file into DataFrame
-    if file_type == "csv":
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
 
-    st.write("✅ File preview:")
-    st.dataframe(df.head())
+    if st.button("Login" if auth_mode == "Login" else "Sign Up"):
+        if auth_mode == "Login":
+            user = login_user(email, password)
+        else:
+            user = signup_user(email, password)
+        
+        if user:
+            st.session_state.user = user
+            st.success(f"✅ {'Logged in' if auth_mode == 'Login' else 'Signed up'} successfully!")
+            st.rerun()
+        else:
+            st.error("❌ Login failed. Check credentials or sign up.")
 
-    # Connect to Snowflake
-    conn = create_connection()
-    cs = conn.cursor()
+if not st.session_state["user"]:
+    login_ui()
+    st.stop()
+st.title("📤 Upload Any Dataset for Insightful Analysis")
 
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+
+if uploaded_file:
     try:
-        table_name = "DYNAMIC_UPLOAD_TABLE"
+        # Read file
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
 
-        # Build CREATE TABLE statement
-        column_defs = ", ".join(infer_column_types(df))
-        create_table_sql = f'CREATE OR REPLACE TABLE {table_name} ({column_defs})'
-        cs.execute(create_table_sql)
+        # Clean column names
+        df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
 
-        # Save to temporary CSV for upload
-        temp_file_path = "temp_uploaded.csv"
-        df.to_csv(temp_file_path, index=False)
+        st.subheader("📄 Preview")
+        st.dataframe(df.head(100))
 
-        # Upload to stage
-        put_command = f"PUT file://{os.path.abspath(temp_file_path)} @%{table_name} AUTO_COMPRESS=TRUE"
-        cs.execute(put_command)
+        # Type detection
+        numeric_cols = df.select_dtypes(include=["int", "float"]).columns.tolist()
+        categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        datetime_cols = df.select_dtypes(include=["datetime64"]).columns.tolist()
 
-        # Ingest using COPY INTO
-        copy_command = f"""
-        COPY INTO {table_name}
-        FROM @%{table_name}
-        FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"')
-        ON_ERROR = 'CONTINUE'
-        """
-        cs.execute(copy_command)
+        # Try to infer datetime if not already parsed
+        for col in df.columns:
+            if df[col].dtype == "object":
+                try:
+                    df[col] = pd.to_datetime(df[col])
+                    datetime_cols.append(col)
+                    categorical_cols.remove(col)
+                except:
+                    pass
 
-        st.success("🎉 File uploaded and ingested into Snowflake successfully!")
+        st.markdown("---")
+        st.header("📈 Column Summary")
 
-        # Show dashboard
-        show_dashboard(df, table_name)
+        # Numeric summary
+        if numeric_cols:
+            st.subheader("🔢 Numeric Columns Summary")
+            st.dataframe(df[numeric_cols].describe().T)
+
+        # Categorical summary
+        if categorical_cols:
+            st.subheader("🔤 Categorical Columns Overview")
+            for col in categorical_cols:
+                st.markdown(f"**{col}** — top 5 values")
+                st.write(df[col].value_counts().head())
+
+        # Date summary
+        if datetime_cols:
+            st.subheader("📅 Date Columns")
+            for col in datetime_cols:
+                st.markdown(f"**{col}**")
+                st.write(f"Date range: {df[col].min()} → {df[col].max()}")
+                st.line_chart(df.set_index(col).resample("D").size())
+
+        st.markdown("---")
+        st.header("📊 Smart Visualizations")
+
+        # Histogram for numeric
+        if numeric_cols:
+            num_col = st.selectbox("📈 Select numeric column for distribution", numeric_cols)
+            fig, ax = plt.subplots()
+            sns.histplot(df[num_col], kde=True, ax=ax)
+            st.pyplot(fig)
+
+        # Bar chart for categorical
+        if categorical_cols:
+            cat_col = st.selectbox("📊 Select categorical column for frequency", categorical_cols)
+            st.bar_chart(df[cat_col].value_counts().head(10))
+
+        # Line chart for time series
+        if datetime_cols and numeric_cols:
+            time_col = datetime_cols[0]
+            num_col = numeric_cols[0]
+            df_time = df[[time_col, num_col]].dropna()
+            df_time = df_time.groupby(df_time[time_col].dt.date)[num_col].mean()
+            st.line_chart(df_time)
 
     except Exception as e:
-        st.error(f"❌ Error during ingestion: {e}")
-    finally:
-        cs.close()
-        conn.close()
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-def show_dashboard(df, table_name):
-    st.subheader("📊 Dashboard")
-    if 'date' in df.columns.str.lower().tolist():
-        try:
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            date_col = 'date'
-        except:
-            date_col = None
-    else:
-        date_col = None
-
-    st.metric("Total Rows", df.shape[0])
-    st.metric("Total Columns", df.shape[1])
-
-    # Show column-wise summary
-    st.write("🧾 Summary:")
-    st.dataframe(df.describe(include='all'))
-
-    # If numeric columns, show chart
-    numeric_cols = df.select_dtypes(include='number').columns
-    if len(numeric_cols) >= 1:
-        st.subheader("📈 Sample Chart")
-        st.bar_chart(df[numeric_cols].head(20))
-
-st.title("🧠 Smart Snowflake Uploader + Dashboard")
-file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
-
-if file:
-    file_type = "csv" if file.name.endswith(".csv") else "excel"
-    upload_and_ingest(file, file_type)
+        st.error(f"❌ Error processing file: {e}")
