@@ -1,4 +1,5 @@
-import pyrebase
+import pyrebase_auth as pyrebase
+
 from config import FIREBASE_CONFIG
 
 firebase = pyrebase.initialize_app(FIREBASE_CONFIG)
